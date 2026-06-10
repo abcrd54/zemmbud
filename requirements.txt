@@ -1,0 +1,3 @@
+nodriver
+python-telegram-bot[job-queue]
+python-dotenv
