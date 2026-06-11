@@ -2,6 +2,16 @@ import nodriver as uc
 import asyncio
 import re
 import json
+import sys
+import traceback
+from urllib.parse import quote
+
+if sys.platform == "win32":
+    asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
+RECENT_POSTS_FILTER = "eyJyZWNlbnRfcG9zdHM6MCI6IntcIm5hbWVcIjpcInJlY2VudF9wb3N0c1wiLFwiYXJnc1wiOlwiXCJ9In0%3D"
 
 async def search_posts(keyword, cookie_str, progress_callback=None):
     browser = None
@@ -37,226 +47,87 @@ async def search_posts(keyword, cookie_str, progress_callback=None):
         await page.reload()
         await asyncio.sleep(3)
         
-        search_url = f"https://www.facebook.com/search/groups/?q={keyword.replace(' ', '+')}"
-        await report("[PHASE 1] Mencari grup...", 5)
+        encoded_keyword = quote(keyword)
+        search_url = f"https://www.facebook.com/search/top?q={encoded_keyword}&filters={RECENT_POSTS_FILTER}"
+        await report(f"[SEARCH] Mencari post: {keyword}", 10)
         page = await browser.get(search_url)
-        await asyncio.sleep(5)
+        await asyncio.sleep(6)
         
-        for _ in range(3):
+        click_r = await page.evaluate("""
+        (function() {
+            var spans = document.querySelectorAll('span');
+            for (var i = 0; i < spans.length; i++) {
+                if (spans[i].textContent.trim() === 'Postingan terbaru') {
+                    spans[i].click();
+                    return 'clicked';
+                }
+            }
+            return 'not_found';
+        })()
+        """)
+        
+        if click_r == 'clicked':
+            await report("[FILTER] Filter 'Postingan terbaru' diklik", 30)
+            await asyncio.sleep(6)
+        
+        for _ in range(5):
             await page.scroll_down(1000)
             await asyncio.sleep(1.5)
         
+        await report("[EXTRACT] Mengambil post dari JSON data...", 50)
+        
         content = await page.get_content()
         
-        group_pattern = re.compile(r'href="(https://www\.facebook\.com/groups/[^"?]+)"')
-        group_matches = group_pattern.findall(content)
+        seen_ids = set()
+        post_urls = []
         
-        groups = []
-        seen_urls = set()
-        seen_names = set()
+        for m in re.finditer(r'https?:[/\\]+[/\\]*www\.facebook\.com[/\\]+groups[/\\]+\d+[/\\]+posts[/\\]+(\d+)', content):
+            post_id = m.group(1)
+            if post_id not in seen_ids:
+                seen_ids.add(post_id)
+                url = m.group(0).replace("\\/", "/").replace("\\\\", "\\")
+                post_urls.append(url)
         
-        for href in group_matches:
-            if href in seen_urls:
-                continue
-            seen_urls.add(href)
-            
-            text_match = re.search(rf'href="{re.escape(href)}"[^>]*>([^<]+)', content)
-            text = text_match.group(1).strip() if text_match else ""
-            
-            if text and len(text) > 3 and text not in seen_names:
-                seen_names.add(text)
-                groups.append({"url": href, "name": text[:80]})
+        for m in re.finditer(r'https?:[/\\]+[/\\]*www\.facebook\.com[/\\]+groups[/\\]+\d+[/\\]+permalink[/\\]+(\d+)', content):
+            post_id = m.group(1)
+            if post_id not in seen_ids:
+                seen_ids.add(post_id)
+                url = m.group(0).replace("\\/", "/").replace("\\\\", "\\")
+                post_urls.append(url)
         
-        await report(f"  Ditemukan {len(groups)} grup", 10)
+        for m in re.finditer(r'https?:[/\\]+[/\\]*www\.facebook\.com[/\\]+permalink\.php\?story_fbid=([^"&\\]+)&amp;id=(\d+)', content):
+            post_id = m.group(1)
+            if post_id not in seen_ids:
+                seen_ids.add(post_id)
+                url = m.group(0).replace("\\/", "/").replace("&amp;", "&")
+                post_urls.append(url)
         
-        max_groups_check = min(len(groups), 20)
-        await report(f"[PHASE 2] Cek {max_groups_check} grup...", 10)
+        for m in re.finditer(r'https?:[/\\]+[/\\]*www\.facebook\.com[/\\]+([a-zA-Z0-9_.]+)[/\\]+posts[/\\]+([a-zA-Z0-9]+)', content):
+            post_id = m.group(2)
+            url = m.group(0).replace("\\/", "/")
+            if '/search/' not in url and post_id not in seen_ids:
+                seen_ids.add(post_id)
+                post_urls.append(url)
         
-        approved_groups = []
-        checked = 0
-        skipped = 0
-        
-        for group in groups:
-            if checked >= max_groups_check:
-                break
-            if len(approved_groups) >= 10:
-                break
-                
-            checked += 1
-            pct = 10 + int((checked / max_groups_check) * 35)
-            
-            try:
-                page = await browser.get(group["url"])
-                await asyncio.sleep(4)
-                
-                for _ in range(2):
-                    await page.scroll_down(600)
-                    await asyncio.sleep(1)
-                
-                js_check = """
-                (function() {
-                    var body = document.body.innerText || '';
-                    var lower = body.toLowerCase();
-                    
-                    if (lower.includes('anda tidak dapat memposting') || lower.includes('you cannot post')) {
-                        return 'cannot_post';
-                    }
-                    if (lower.includes('menunggu persetujuan') || lower.includes('pending approval') || lower.includes('postingan ini menunggu')) {
-                        return 'needs_approval';
-                    }
-                    if (lower.includes('komentar dinonaktifkan') || lower.includes('comments turned off')) {
-                        return 'comments_disabled';
-                    }
-                    if (lower.includes('postingan baru memerlukan persetujuan') || lower.includes('new posts require approval')) {
-                        return 'posts_need_approval';
-                    }
-                    
-                    var articles = document.querySelectorAll('[role="article"]');
-                    var hasCommentBtn = false;
-                    for (var i = 0; i < Math.min(articles.length, 3); i++) {
-                        var artText = (articles[i].innerText || '').toLowerCase();
-                        if (artText.includes('menunggu persetujuan')) {
-                            return 'post_pending';
-                        }
-                        var commentBtn = articles[i].querySelector('[aria-label="Komentari"], [aria-label="Comment"]');
-                        if (commentBtn) {
-                            hasCommentBtn = true;
-                        }
-                    }
-                    
-                    var commentBox = document.querySelector('[data-lexical-editor="true"][role="textbox"]');
-                    if (commentBox) {
-                        return 'ok';
-                    }
-                    
-                    if (hasCommentBtn) {
-                        return 'ok';
-                    }
-                    
-                    return 'ok';
-                })()
-                """
-                
-                check_r = await page.evaluate(js_check)
-                
-                if check_r == 'ok':
-                    approved_groups.append(group)
-                    await report(f"  [{checked}] OK {group['name'][:40]}", pct)
-                else:
-                    skipped += 1
-                    await report(f"  [{checked}] SKIP {group['name'][:40]} ({check_r})", pct)
-                    
-            except Exception as e:
-                await report(f"  [{checked}] ERR {group['name'][:40]}", pct)
-                continue
-        
-        await report(f"[PHASE 3] Cari post di {len(approved_groups)} grup...", 50)
+        post_urls = list(post_urls)
+        await report(f"  Ditemukan {len(post_urls)} post URL", 60)
         
         all_posts = []
+        for url in post_urls[:10]:
+            all_posts.append({
+                "index": len(all_posts) + 1,
+                "group": "",
+                "text": "",
+                "post_url": url,
+            })
         
-        for idx, group in enumerate(approved_groups):
-            if len(all_posts) >= 10:
-                break
-                
-            pct = 50 + int(((idx + 1) / len(approved_groups)) * 40)
-            
-            try:
-                page = await browser.get(group["url"])
-                await asyncio.sleep(5)
-                
-                for _ in range(3):
-                    await page.scroll_down(800)
-                    await asyncio.sleep(1)
-                
-                keywords_json = json.dumps(keyword_words)
-                
-                js_code = f"""
-                (function() {{
-                    var keywords = {keywords_json};
-                    var posts = [];
-                    var articles = document.querySelectorAll('[role="article"]');
-                    for (var i = 0; i < Math.min(articles.length, 20); i++) {{
-                        var text = articles[i].innerText || articles[i].textContent || '';
-                        text = text.trim().replace(/\\s+/g, ' ').substring(0, 300);
-                        if (text.length < 20) continue;
-                        
-                        var textLower = text.toLowerCase();
-                        var matched = false;
-                        if (keywords.length === 0) {{
-                            matched = true;
-                        }} else {{
-                            for (var k = 0; k < keywords.length; k++) {{
-                                if (textLower.includes(keywords[k])) {{
-                                    matched = true;
-                                    break;
-                                }}
-                            }}
-                        }}
-                        
-                        if (!matched) continue;
-                        
-                        var url = '';
-                        var links = articles[i].querySelectorAll('a[href*="/posts/"], a[href*="permalink"], a[href*="story_fbid"]');
-                        for (var j = 0; j < links.length; j++) {{
-                            var href = links[j].href;
-                            if (href && (href.includes('/posts/') || href.includes('permalink') || href.includes('story_fbid'))) {{
-                                url = href.split('?')[0];
-                                break;
-                            }}
-                        }}
-                        if (!url) {{
-                            var allLinks = articles[i].querySelectorAll('a[href]');
-                            for (var m = 0; m < allLinks.length; m++) {{
-                                var h = allLinks[m].href;
-                                if (h && h.includes('facebook.com') && h.includes('/posts/')) {{
-                                    url = h.split('?')[0];
-                                    break;
-                                }}
-                            }}
-                        }}
-                        if (url) {{
-                            posts.push({{index: i, text: text, url: url}});
-                        }}
-                    }}
-                    return JSON.stringify(posts);
-                }})()
-                """
-                
-                result = await page.evaluate(js_code)
-                
-                if result:
-                    try:
-                        posts_data = json.loads(result)
-                        
-                        for pd in posts_data:
-                            if len(all_posts) >= 10:
-                                break
-                            
-                            all_posts.append({
-                                "index": len(all_posts) + 1,
-                                "article_index": pd["index"],
-                                "group": group["name"],
-                                "group_url": group["url"],
-                                "text": pd["text"],
-                                "post_url": pd.get("url", ""),
-                            })
-                        
-                        await report(f"  [{idx+1}] {group['name'][:35]} -> {len(posts_data)} post", pct)
-                    except json.JSONDecodeError:
-                        await report(f"  [{idx+1}] {group['name'][:35]} -> error", pct)
-                else:
-                    await report(f"  [{idx+1}] {group['name'][:35]} -> 0 post", pct)
-                    
-            except Exception as e:
-                await report(f"  [{idx+1}] {group['name'][:35]} -> err", pct)
-                continue
-        
-        await report(f"[DONE] {len(all_posts)} post dari {len(approved_groups)} grup", 95)
+        await report(f"[DONE] {len(all_posts)} post siap dikomentari", 95)
         
         return {"posts": all_posts, "browser": browser, "page": page}
     
     except Exception as e:
-        print(f"Error in search_posts: {e}")
+        print("Error in search_posts:")
+        traceback.print_exc()
         if browser:
             try:
                 await browser.stop()
@@ -279,6 +150,30 @@ async def comment_on_post(page, browser, post_url, comment_text, progress_callba
         for _ in range(2):
             await page.scroll_down(500)
             await asyncio.sleep(1)
+        
+        approval_check = await page.evaluate("""
+        (function() {
+            var body = document.body.innerText || '';
+            var lower = body.toLowerCase();
+            if (lower.includes('menunggu persetujuan') || lower.includes('pending approval') || lower.includes('postingan ini menunggu')) {
+                return 'needs_approval';
+            }
+            if (lower.includes('komentar dinonaktifkan') || lower.includes('comments turned off')) {
+                return 'comments_disabled';
+            }
+            if (lower.includes('anda tidak dapat memposting') || lower.includes('you cannot post')) {
+                return 'cannot_post';
+            }
+            return 'ok';
+        })()
+        """)
+        
+        if approval_check == 'needs_approval':
+            return {"success": False, "message": "Grup butuh persetujuan admin", "skip": True}
+        elif approval_check == 'comments_disabled':
+            return {"success": False, "message": "Komentar dinonaktifkan", "skip": True}
+        elif approval_check == 'cannot_post':
+            return {"success": False, "message": "Tidak bisa posting", "skip": True}
         
         js_click_comment = """
         (function() {
@@ -367,5 +262,6 @@ async def comment_on_post(page, browser, post_url, comment_text, progress_callba
             return {"success": False, "message": "Gagal verifikasi"}
     
     except Exception as e:
-        print(f"Error in comment_on_post: {e}")
+        print("Error in comment_on_post:")
+        traceback.print_exc()
         return {"success": False, "message": str(e)}

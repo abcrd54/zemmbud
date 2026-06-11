@@ -1,9 +1,14 @@
 import asyncio
+import sys
+import random
 from config import load_cookies, get_random_cookie
 from scraper import search_posts, comment_on_post
 
-KEYWORD = "wtb samsung a35"
-COMMENT = "ready nih, murahin aja gas rekber https://s.shopee.co.id/qh1jGF7pM"
+if sys.platform == "win32":
+    asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
+
+KEYWORD = "iphone"
+COMMENT = "ready nih, gas rekber cuy https://s.shopee.co.id/qh1jGF7pM"
 
 async def main():
     cookies = load_cookies()
@@ -38,11 +43,34 @@ async def main():
         print(f"     {post.get('post_url')}")
     
     browser = result["browser"]
-    post = result["posts"][0]
+    page = result["page"]
     
-    print(f"\n[COMMENT] Testing ke post pertama...")
-    r = await comment_on_post(browser, browser, post.get("post_url", ""), COMMENT, progress)
-    print(f"[COMMENT] {'SUCCESS' if r['success'] else 'FAILED'}: {r['message']}")
+    posts_to_comment = result["posts"][:5]
+    print(f"\n[COMMENT] Mencoba comment ke max {len(posts_to_comment)} post...")
+    
+    commented = 0
+    for i, post in enumerate(posts_to_comment):
+        if commented >= 3:
+            break
+            
+        print(f"\n--- Post {i+1}/{len(posts_to_comment)} ---")
+        print(f"  URL: {post.get('post_url')}")
+        r = await comment_on_post(page, browser, post.get("post_url", ""), COMMENT, progress)
+        
+        if r.get("skip"):
+            print(f"  SKIP: {r['message']}")
+            continue
+        
+        print(f"  Result: {'SUCCESS' if r['success'] else 'FAILED'}: {r['message']}")
+        if r['success']:
+            commented += 1
+        
+        if i < len(posts_to_comment) - 1 and commented < 3:
+            delay = random.uniform(5, 8)
+            print(f"  Waiting {delay:.1f}s...")
+            await asyncio.sleep(delay)
+    
+    print(f"\n[DONE] Berhasil comment ke {commented} post")
     
     try: await browser.stop()
     except: pass
